@@ -49,7 +49,8 @@ def prepare_dataset(model_name: str = DEFAULT_MODEL, source: str = SOURCE_DATASE
         img_files = [f for f in os.listdir(img_src) if os.path.splitext(f)[1].lower() in image_exts]
         print(f"  {split}: {len(img_files)} images")
 
-        for img_file in tqdm(img_files, desc=f"  {split}", leave=False):
+        img_desc = f"  {split} images (resize)" if split == "train" else f"  {split} images (copy)"
+        for img_file in tqdm(img_files, desc=img_desc, leave=True, unit="img"):
             src_path = os.path.join(img_src, img_file)
             dst_path = os.path.join(img_dst, img_file)
 
@@ -64,7 +65,8 @@ def prepare_dataset(model_name: str = DEFAULT_MODEL, source: str = SOURCE_DATASE
                 shutil.copy2(src_path, dst_path)
 
         if os.path.isdir(lbl_src):
-            for lbl_file in os.listdir(lbl_src):
+            lbl_files = os.listdir(lbl_src)
+            for lbl_file in tqdm(lbl_files, desc=f"  {split} labels (copy)", leave=True, unit="lbl"):
                 shutil.copy2(
                     os.path.join(lbl_src, lbl_file),
                     os.path.join(lbl_dst, lbl_file),

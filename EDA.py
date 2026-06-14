@@ -4,10 +4,10 @@ Exploratory Data Analysis — display sample images with bounding boxes.
 Usage:
     python EDA.py --split train --sample 5
     python EDA.py --split test  --sample 5 --class Car
+    python EDA.py --split test  --sample 5 --class Car --name my_eda
 """
 
 import argparse
-import ast
 import os
 
 import cv2
@@ -15,7 +15,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import yaml
 
-from utils.config import SOURCE_DATASET
+from utils.config import SOURCE_DATASET, OUTPUTS_DIR
+from utils.trial_utils import get_next_trial_name
 
 
 def load_class_names(dataset_dir: str):
@@ -59,7 +60,8 @@ def draw_yolo_boxes(image, label_path: str, class_names):
     return image
 
 
-def run_eda(split: str, n_samples: int, class_filter: str | None, dataset_dir: str):
+def run_eda(split: str, n_samples: int, class_filter: str | None, dataset_dir: str,
+            name: str | None = None):
     class_names = load_class_names(dataset_dir)
 
     manifest_path = os.path.join(dataset_dir, "images_manifest.csv")
@@ -114,9 +116,15 @@ def run_eda(split: str, n_samples: int, class_filter: str | None, dataset_dir: s
     plt.suptitle(title, fontsize=14)
     plt.tight_layout()
 
-    save_name = f"EDA_{split}" + (f"_{class_filter}" if class_filter else "") + f"_n{n}.png"
-    plt.savefig(save_name, bbox_inches="tight", dpi=150)
-    print(f"Saved: {save_name}")
+    # Output directory: outputs/EDA_{name}/
+    eda_name = name or get_next_trial_name(OUTPUTS_DIR, "EDA")
+    out_dir = os.path.join(OUTPUTS_DIR, eda_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    file_stem = f"EDA_{split}" + (f"_{class_filter}" if class_filter else "") + f"_n{n}"
+    save_path = os.path.join(out_dir, f"{file_stem}.png")
+    plt.savefig(save_path, bbox_inches="tight", dpi=150)
+    print(f"Saved: {save_path}")
     plt.show()
 
 
@@ -128,6 +136,9 @@ if __name__ == "__main__":
     parser.add_argument("--class", dest="class_filter", default=None,
                         help="Filter images containing this class name")
     parser.add_argument("--source", default=SOURCE_DATASET, help="Source dataset directory")
+    parser.add_argument("--name", default=None,
+                        help="Output folder suffix (e.g. 'run1' → outputs/EDA_run1/). "
+                             "Auto-assigned as EDA_01, EDA_02, ... if omitted.")
     args = parser.parse_args()
 
-    run_eda(args.split, args.sample, args.class_filter, args.source)
+    run_eda(args.split, args.sample, args.class_filter, args.source, args.name)
