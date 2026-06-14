@@ -60,7 +60,7 @@ python main.py --model rfdetr-medium --batch-size 2 --lr 5e-5
 |---|---|---|
 | `--model` | `rfdetr-nano` | Model variant |
 | `--epochs` | `10` | Training epochs |
-| `--batch-size` | `4` | Batch size |
+| `--batch-size` | `4` | Batch size per GPU |
 | `--lr` | `1e-4` | Learning rate |
 | `--trial-name` | auto (`trial_01`, …) | Output folder name |
 | `--grad-accum` | `2` | Gradient accumulation steps |
@@ -81,25 +81,28 @@ python dataset_prep.py --model rfdetr-medium
 
 Output: `/kaggle/working/dataset_{resolution}/`
 
+If the output directory already contains `data.yaml`, the step is skipped automatically.
+
 ---
 
 ### `EDA.py` — Exploratory Data Analysis
 
-Visualise random samples with bounding boxes drawn.
+Visualise random samples with bounding boxes drawn from YOLO labels.
 
 ```bash
 python EDA.py --split train --sample 5
 python EDA.py --split test  --sample 5 --class Car
-python EDA.py --split valid --sample 3 --class Person
+python EDA.py --split valid --sample 3 --class Person --name my_eda
 ```
 
 | Argument | Default | Description |
 |---|---|---|
-| `--split` | `train` | Dataset split |
-| `--sample` | `5` | Number of images to show |
-| `--class` | — | Filter by class name (case-insensitive) |
+| `--split` | `train` | Dataset split to sample from |
+| `--sample` | `5` | Number of images to display |
+| `--class` | — | Filter to images containing this class (case-insensitive) |
+| `--name` | auto (`EDA_01`, …) | Output folder suffix |
 
-Saves a PNG to the working directory and displays it inline.
+Saves a PNG to `outputs/EDA_{name}/` and displays it inline.
 
 ---
 
@@ -107,10 +110,13 @@ Saves a PNG to the working directory and displays it inline.
 
 ```bash
 python train.py
-python train.py --model rfdetr-small --epochs 30 --trial-name run02
+python train.py --model rfdetr-large --epochs 30 --batch-size 4 --grad-accum 2
+python train.py --model rfdetr-small --epochs 20 --trial-name run02
 ```
 
 Accepts the same arguments as `main.py` (training args only).
+
+**Multi-GPU (Kaggle T4 x2):** GPU count is detected automatically. Two GPUs use PyTorch Lightning DDP with `ddp_find_unused_parameters_true`. No extra flags needed.
 
 **Output layout:**
 ```
@@ -147,9 +153,9 @@ python inference.py --file image.jpg
 # Folder of images
 python inference.py --file /path/to/images/ --name my_run
 
-# Evaluate on a dataset split (computes confusion matrix + metrics)
+# Evaluate on a dataset split
 python inference.py --validate valid
-python inference.py --validate test  --model outputs/trial_01/save_model/checkpoint_best_total.pth
+python inference.py --validate test --model outputs/trial_01/save_model/checkpoint_best_total.pth
 ```
 
 If `--model` is not specified, the script **auto-finds the most recently trained checkpoint** in `outputs/trial_*/save_model/`.
@@ -160,8 +166,37 @@ If `--model` is not specified, the script **auto-finds the most recently trained
 | `--validate` | — | Evaluate on `train`/`valid`/`test` split |
 | `--name` | auto (`inference_01`, …) | Output folder name |
 | `--model` | auto-find latest | Path to `.pth` checkpoint |
+| `--model-name` | auto | Model variant hint (e.g. `rfdetr-nano`) |
 | `--threshold` | `0.5` | Confidence threshold |
 | `--iou-threshold` | `0.5` | IoU threshold for confusion matrix |
+| `--source` | config value | Source dataset directory |
+
+**Timing summary** is printed after every run. The first image (GPU warmup) is excluded from the average:
+
+```
+Inference timing (5183 images):
+  1st image (warmup) : 312.45 ms
+  Avg (excl. warmup) : 18.72 ms/image  (5182 images)
+  FPS (avg)          : 53.4 fps
+```
+
+**`--validate` mode** additionally computes and prints a full metrics table:
+
+```
+────────────────────────────────────────────────────────────────────────
+                        Val — Overall Metrics
+────────────────────────────────────────────────────────────────────────
+  mAP 50:95    mAP 50    mAP 75    mAR @100      F1       Prec     Recall
+────────────────────────────────────────────────────────────────────────
+   0.4521      0.6813    0.4902     0.5631      0.6120   0.6834   0.5543
+
+Val — Per-class Metrics
+────────────────────────────────────────────────────────────────────────
+  Class            AP 50:95      AR        F1      Precision   Recall
+────────────────────────────────────────────────────────────────────────
+  Car               0.6102    0.7034    0.7231     0.7890     0.6672
+  ...
+```
 
 **Output layout:**
 ```
@@ -172,7 +207,7 @@ outputs/inference_01/
 │   └── *.jpg                            # annotated copies
 ├── confusion_matrix_inference_01.json   # --validate only
 ├── confusion_matrix_inference_01.png    # --validate only
-└── metrics_inference_01.json            # --validate only (per-class precision/recall)
+└── metrics_inference_01.json            # --validate only: mAP, AR, F1, precision, recall per class
 ```
 
 ---
@@ -190,7 +225,12 @@ DEFAULT_EPOCHS       = 10
 DEFAULT_BATCH_SIZE   = 4
 DEFAULT_LR           = 1e-4
 DEFAULT_GRAD_ACCUM   = 2
+DEFAULT_GRADIENT_CHECKPOINTING = True
+
 DEFAULT_CONF_THRESHOLD = 0.5
+DEFAULT_IOU_THRESHOLD  = 0.5
+
+OUTPUTS_DIR = "outputs"
 ```
 
 ---
@@ -216,4 +256,10 @@ RF-DETR-Finetune/
 
 ## GPU
 
-GPU is auto-detected at startup. If no GPU is available, training falls back to CPU (slow — not recommended for full training runs).
+GPU is detected automatically at startup:
+
+- **1 GPU** — standard single-device training
+- **2 GPUs (Kaggle T4 x2)** — DDP training enabled automatically, no extra flags needed
+- **No GPU** — falls back to CPU (very slow, not recommended for full training runs)
+
+Gradient accumulation (`--grad-accum`) simulates a larger effective batch size without increasing GPU memory usage.
