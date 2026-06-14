@@ -1,0 +1,11 @@
+rfdetr
+supervision
+opencv-python
+matplotlib
+seaborn
+pandas
+faster-coco-eval
+tensorboard
+tqdm
+pyyaml
+scikit-learn
