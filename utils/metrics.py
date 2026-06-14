@@ -12,7 +12,7 @@ import pandas as pd
 import supervision as sv
 
 
-def _yolo_label_to_detections(label_path: str, img_w: int, img_h: int) -> sv.Detections:
+def yolo_label_to_detections(label_path: str, img_w: int, img_h: int) -> sv.Detections:
     boxes, class_ids = [], []
     try:
         with open(label_path) as f:
@@ -66,7 +66,7 @@ def compute_confusion_matrix(
             preds = sv.Detections.empty()
 
         label_path = label_dir / (img_path.stem + ".txt")
-        gt = _yolo_label_to_detections(str(label_path), w, h)
+        gt = yolo_label_to_detections(str(label_path), w, h)
 
         predictions_list.append(preds)
         targets_list.append(gt)
@@ -167,3 +167,111 @@ def plot_metrics_from_csv(csv_path: str, output_dir: str, name: str) -> None:
         fig.savefig(path, bbox_inches="tight", dpi=150)
         plt.close(fig)
         print(f"mAP curve saved: {path}")
+
+
+# ── Inference-time metrics ────────────────────────────────────────────────────
+
+def _det_to_tm_pred(det: sv.Detections) -> dict:
+    import torch
+    if len(det) == 0:
+        return {"boxes": torch.zeros((0, 4)), "scores": torch.zeros(0), "labels": torch.zeros(0, dtype=torch.long)}
+    confs = det.confidence if det.confidence is not None else np.ones(len(det))
+    ids   = det.class_id   if det.class_id   is not None else np.zeros(len(det), dtype=int)
+    return {
+        "boxes":  torch.as_tensor(det.xyxy,  dtype=torch.float32),
+        "scores": torch.as_tensor(confs,     dtype=torch.float32),
+        "labels": torch.as_tensor(ids,       dtype=torch.long),
+    }
+
+
+def _det_to_tm_target(det: sv.Detections) -> dict:
+    import torch
+    if len(det) == 0:
+        return {"boxes": torch.zeros((0, 4)), "labels": torch.zeros(0, dtype=torch.long)}
+    ids = det.class_id if det.class_id is not None else np.zeros(len(det), dtype=int)
+    return {
+        "boxes":  torch.as_tensor(det.xyxy, dtype=torch.float32),
+        "labels": torch.as_tensor(ids,      dtype=torch.long),
+    }
+
+
+def compute_map_metrics(preds_tm: list, targets_tm: list, class_names: List[str]) -> dict | None:
+    """Compute mAP / mAR per class using torchmetrics (installed with rfdetr)."""
+    try:
+        from torchmetrics.detection import MeanAveragePrecision
+    except ImportError:
+        print("[WARN] torchmetrics not available — mAP metrics skipped.")
+        return None
+
+    metric = MeanAveragePrecision(class_metrics=True, iou_type="bbox")
+    metric.update(preds_tm, targets_tm)
+    result = metric.compute()
+
+    overall = {
+        "mAP_50_95": float(result.get("map",     0)),
+        "mAP_50":    float(result.get("map_50",  0)),
+        "mAP_75":    float(result.get("map_75",  0)),
+        "mAR_100":   float(result.get("mar_100", 0)),
+    }
+
+    map_per = result.get("map_per_class",     [])
+    mar_per = result.get("mar_100_per_class", [])
+
+    per_class = {}
+    for i, cls in enumerate(class_names):
+        ap = float(map_per[i]) if i < len(map_per) else -1.0
+        ar = float(mar_per[i]) if i < len(mar_per) else -1.0
+        per_class[cls] = {
+            "AP_50_95": max(0.0, ap),
+            "AR":       max(0.0, ar),
+        }
+
+    return {"overall": overall, "per_class": per_class}
+
+
+def print_metrics_table(map_result: dict, cm: sv.ConfusionMatrix, class_names: List[str]) -> None:
+    """Print rfdetr-style Val — Overall and Per-class metrics tables."""
+    matrix = cm.matrix
+
+    # Per-class F1 / Precision / Recall from confusion matrix
+    cls_stats = {}
+    tot_tp = tot_fp = tot_fn = 0.0
+    for i, cls in enumerate(class_names):
+        tp = float(matrix[i, i])
+        fp = float(matrix[:, i].sum() - tp)
+        fn = float(matrix[i, :].sum() - tp)
+        prec   = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1     = 2 * prec * recall / (prec + recall) if (prec + recall) > 0 else 0.0
+        cls_stats[cls] = {"prec": prec, "recall": recall, "f1": f1}
+        tot_tp += tp; tot_fp += fp; tot_fn += fn
+
+    ov_prec   = tot_tp / (tot_tp + tot_fp) if (tot_tp + tot_fp) > 0 else 0.0
+    ov_recall = tot_tp / (tot_tp + tot_fn) if (tot_tp + tot_fn) > 0 else 0.0
+    ov_f1     = 2 * ov_prec * ov_recall / (ov_prec + ov_recall) if (ov_prec + ov_recall) > 0 else 0.0
+
+    ov = map_result["overall"]
+
+    W = 72
+    print("\n" + "─" * W)
+    print("Val — Overall Metrics".center(W))
+    print("─" * W)
+    print(f"  {'mAP 50:95':^10}  {'mAP 50':^8}  {'mAP 75':^8}  {'mAR @100':^10}  {'F1':^8}  {'Prec':^8}  {'Recall':^8}")
+    print("─" * W)
+    print(f"  {ov['mAP_50_95']:^10.4f}  {ov['mAP_50']:^8.4f}  {ov['mAP_75']:^8.4f}"
+          f"  {ov['mAR_100']:^10.4f}  {ov_f1:^8.4f}  {ov_prec:^8.4f}  {ov_recall:^8.4f}")
+    print("─" * W)
+
+    col_w = max((len(c) for c in class_names), default=8)
+    PW = W
+    print(f"\nVal — Per-class Metrics")
+    print("─" * PW)
+    print(f"  {'Class':<{col_w}}  {'AP 50:95':^10}  {'AR':^8}  {'F1':^8}  {'Precision':^10}  {'Recall':^8}")
+    print("─" * PW)
+    for cls in class_names:
+        ap = map_result["per_class"].get(cls, {}).get("AP_50_95", 0.0)
+        ar = map_result["per_class"].get(cls, {}).get("AR",       0.0)
+        st = cls_stats[cls]
+        print(f"  {cls:<{col_w}}  {ap:^10.4f}  {ar:^8.4f}  {st['f1']:^8.4f}"
+              f"  {st['prec']:^10.4f}  {st['recall']:^8.4f}")
+    print("─" * PW)

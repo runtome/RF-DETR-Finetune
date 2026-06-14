@@ -17,8 +17,10 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 import supervision as sv
 import yaml
+from tqdm import tqdm
 
 from utils.config import (
     DEFAULT_CONF_THRESHOLD, DEFAULT_IOU_THRESHOLD,
@@ -71,7 +73,6 @@ def load_model(ckpt_path: str, model_name: str | None = None):
         ModelClass = get_model_class(model_name)
         return ModelClass(pretrain_weights=ckpt_path)
 
-    # Try each model class
     from utils import model_config
     for cfg in model_config.MODEL_CONFIGS.values():
         try:
@@ -80,11 +81,14 @@ def load_model(ckpt_path: str, model_name: str | None = None):
             return cls(pretrain_weights=ckpt_path)
         except Exception:
             continue
-    raise RuntimeError(f"Could not load checkpoint {ckpt_path}. Pass --model-name to specify model class.")
+    raise RuntimeError(
+        f"Could not load checkpoint {ckpt_path}. "
+        "Pass --model-name to specify the model variant."
+    )
 
 
 def annotate_image(img_bgr, detections: sv.Detections, class_names):
-    box_ann = sv.BoxAnnotator()
+    box_ann   = sv.BoxAnnotator()
     label_ann = sv.LabelAnnotator()
     labels = []
     if detections.class_id is not None and detections.confidence is not None:
@@ -112,19 +116,34 @@ def collect_images(file_arg: str | None, validate_split: str | None, source: str
     raise FileNotFoundError(f"--file path not found: {file_arg}")
 
 
+def _print_timing_summary(time_records: list) -> None:
+    if not time_records:
+        return
+    all_ms = [float(r["inference_time_ms"]) for r in time_records]
+    print(f"\nInference timing ({len(all_ms)} images):")
+    print(f"  1st image (warmup) : {all_ms[0]:.2f} ms")
+    if len(all_ms) > 1:
+        rest = all_ms[1:]
+        avg  = sum(rest) / len(rest)
+        print(f"  Avg (excl. warmup) : {avg:.2f} ms/image  ({len(rest)} images)")
+        print(f"  FPS (avg)          : {1000 / avg:.1f} fps")
+    else:
+        print("  (only 1 image — warmup not excluded)")
+
+
 def run_inference(args=None):
     parser = argparse.ArgumentParser(description="RF-DETR inference")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--file", default=None, help="Image file or folder path")
     group.add_argument("--validate", default=None, choices=["train", "valid", "test"],
-                       help="Evaluate on a dataset split (computes metrics)")
+                       help="Evaluate on a dataset split")
     parser.add_argument("--split", default=None, dest="validate",
                         choices=["train", "valid", "test"],
                         help="Alias for --validate")
-    parser.add_argument("--name", default=None, help="Output folder name (auto if omitted)")
-    parser.add_argument("--model", default=None, help="Checkpoint path (auto-finds latest if omitted)")
+    parser.add_argument("--name",       default=None, help="Output folder name (auto if omitted)")
+    parser.add_argument("--model",      default=None, help="Checkpoint path (auto-finds latest if omitted)")
     parser.add_argument("--model-name", default=None, help="rfdetr model variant (e.g. rfdetr-nano)")
-    parser.add_argument("--threshold", type=float, default=DEFAULT_CONF_THRESHOLD)
+    parser.add_argument("--threshold",     type=float, default=DEFAULT_CONF_THRESHOLD)
     parser.add_argument("--iou-threshold", type=float, default=DEFAULT_IOU_THRESHOLD)
     parser.add_argument("--source", default=SOURCE_DATASET, help="Source dataset directory")
 
@@ -136,11 +155,11 @@ def run_inference(args=None):
     if args.file is None and args.validate is None:
         parser.error("Provide either --file or --validate.")
 
-    name = args.name or get_next_trial_name(OUTPUTS_DIR, "inference")
-    out_dir = os.path.join(OUTPUTS_DIR, name)
+    name        = args.name or get_next_trial_name(OUTPUTS_DIR, "inference")
+    out_dir     = os.path.join(OUTPUTS_DIR, name)
     img_out_dir = os.path.join(out_dir, "inference_image")
-    log_path = os.path.join(out_dir, f"outputs_log_{name}.txt")
-    csv_path = os.path.join(out_dir, f"inference_time_{name}.csv")
+    log_path    = os.path.join(out_dir, f"outputs_log_{name}.txt")
+    csv_path    = os.path.join(out_dir, f"inference_time_{name}.csv")
 
     os.makedirs(img_out_dir, exist_ok=True)
 
@@ -168,7 +187,7 @@ def run_inference(args=None):
         else:
             print("GPU: not available, using CPU")
 
-        # Load checkpoint
+        # Load model
         ckpt_path = args.model or find_latest_checkpoint(OUTPUTS_DIR)
         if ckpt_path is None:
             raise FileNotFoundError(
@@ -184,17 +203,28 @@ def run_inference(args=None):
             class_names = getattr(model, "class_names", [])
         print(f"Classes: {len(class_names)}")
 
-        # Collect images
+        # Collect image list
         image_files, label_dir = collect_images(args.file, args.validate, args.source)
         print(f"Images to process: {len(image_files)}")
 
-        time_records = []
+        # Import label parser for --validate mode
+        do_metrics = args.validate is not None and label_dir is not None
+        if do_metrics:
+            from utils.metrics import yolo_label_to_detections, _det_to_tm_pred, _det_to_tm_target
+            preds_sv:   list = []
+            targets_sv: list = []
+            preds_tm:   list = []
+            targets_tm: list = []
 
-        for img_path in image_files:
+        time_records: list = []
+
+        # ── Main inference loop ───────────────────────────────────────────────
+        for img_path in tqdm(image_files, desc="Inference", unit="img"):
             img_bgr = cv2.imread(str(img_path))
             if img_bgr is None:
                 print(f"[WARN] Cannot read {img_path}, skipping.")
                 continue
+            h, w = img_bgr.shape[:2]
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
             t0 = time.perf_counter()
@@ -202,10 +232,21 @@ def run_inference(args=None):
             elapsed_ms = (time.perf_counter() - t0) * 1000
 
             annotated = annotate_image(img_bgr, detections, class_names)
-            out_img_path = os.path.join(img_out_dir, img_path.name)
-            cv2.imwrite(out_img_path, annotated)
-
+            cv2.imwrite(os.path.join(img_out_dir, img_path.name), annotated)
             time_records.append({"filename": img_path.name, "inference_time_ms": f"{elapsed_ms:.2f}"})
+
+            # Collect for metrics (--validate only)
+            if do_metrics:
+                gt = yolo_label_to_detections(
+                    str(label_dir / (img_path.stem + ".txt")), w, h
+                )
+                preds_sv.append(detections)
+                targets_sv.append(gt)
+                preds_tm.append(_det_to_tm_pred(detections))
+                targets_tm.append(_det_to_tm_target(gt))
+
+        # ── Timing summary (always printed) ──────────────────────────────────
+        _print_timing_summary(time_records)
 
         # Write CSV
         with open(csv_path, "w", newline="") as f:
@@ -214,38 +255,47 @@ def run_inference(args=None):
             writer.writerows(time_records)
         print(f"Inference time CSV: {csv_path}")
 
-        # Validation metrics
-        if args.validate and label_dir is not None:
+        # ── Validation metrics (--validate only) ─────────────────────────────
+        if do_metrics and preds_sv:
             print(f"\nComputing metrics on split '{args.validate}' ...")
-            from utils.metrics import compute_confusion_matrix, save_confusion_matrix
-            cm = compute_confusion_matrix(
-                model,
-                image_dir=str(Path(args.source) / args.validate / "images"),
-                label_dir=str(label_dir),
-                class_names=class_names,
+
+            # Confusion matrix (no second inference pass — uses collected lists)
+            cm = sv.ConfusionMatrix.from_detections(
+                predictions=preds_sv,
+                targets=targets_sv,
+                classes=class_names,
                 conf_threshold=args.threshold,
                 iou_threshold=args.iou_threshold,
             )
+            from utils.metrics import save_confusion_matrix, compute_map_metrics, print_metrics_table
             save_confusion_matrix(cm, out_dir, name)
 
-            # Basic per-class metrics from confusion matrix
-            matrix = cm.matrix  # shape [n_classes+1, n_classes+1]
-            metrics_data = {"classes": {}}
-            for i, cls in enumerate(class_names):
-                tp = float(matrix[i, i])
-                fp = float(matrix[:, i].sum() - tp)
-                fn = float(matrix[i, :].sum() - tp)
-                precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                metrics_data["classes"][cls] = {
-                    "TP": tp, "FP": fp, "FN": fn,
-                    "precision": round(precision, 4),
-                    "recall": round(recall, 4),
-                }
-            metrics_path = os.path.join(out_dir, f"metrics_{name}.json")
-            with open(metrics_path, "w") as f:
-                json.dump(metrics_data, f, indent=2)
-            print(f"Metrics JSON: {metrics_path}")
+            # mAP table
+            map_result = compute_map_metrics(preds_tm, targets_tm, class_names)
+            if map_result:
+                print_metrics_table(map_result, cm, class_names)
+
+                # Build combined metrics JSON
+                matrix = cm.matrix
+                metrics_data: dict = {"overall": map_result["overall"], "per_class": {}}
+                for i, cls in enumerate(class_names):
+                    tp = float(matrix[i, i])
+                    fp = float(matrix[:, i].sum() - tp)
+                    fn = float(matrix[i, :].sum() - tp)
+                    prec   = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                    f1     = 2 * prec * recall / (prec + recall) if (prec + recall) > 0 else 0.0
+                    metrics_data["per_class"][cls] = {
+                        "AP_50_95":  map_result["per_class"].get(cls, {}).get("AP_50_95", 0.0),
+                        "AR":        map_result["per_class"].get(cls, {}).get("AR",       0.0),
+                        "F1":        round(f1,     4),
+                        "precision": round(prec,   4),
+                        "recall":    round(recall, 4),
+                    }
+                metrics_path = os.path.join(out_dir, f"metrics_{name}.json")
+                with open(metrics_path, "w") as f:
+                    json.dump(metrics_data, f, indent=2)
+                print(f"Metrics JSON: {metrics_path}")
 
         print("\n" + "=" * 60)
         print(f"Done. Outputs saved to: {out_dir}")
