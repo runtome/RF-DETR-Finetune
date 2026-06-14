@@ -81,6 +81,8 @@ def compute_confusion_matrix(
 
 
 def save_confusion_matrix(cm: sv.ConfusionMatrix, output_dir: str, name: str) -> None:
+    import seaborn as sns
+
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, f"confusion_matrix_{name}.json")
     with open(json_path, "w") as f:
@@ -88,7 +90,34 @@ def save_confusion_matrix(cm: sv.ConfusionMatrix, output_dir: str, name: str) ->
     print(f"Confusion matrix JSON saved: {json_path}")
 
     png_path = os.path.join(output_dir, f"confusion_matrix_{name}.png")
-    fig = cm.plot(show_in_notebook=False)
+    matrix = cm.matrix.astype(int)
+    # supervision stores class names in cm.classes (n_classes entries, no background)
+    class_labels = list(getattr(cm, "classes", []))
+    if class_labels:
+        labels = class_labels + ["Background"]
+    else:
+        labels = [str(i) for i in range(matrix.shape[0])]
+
+    n = matrix.shape[0]
+    fig_w = max(10, n // 2 + 2)
+    fig_h = max(8, n // 2)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    sns.heatmap(
+        matrix,
+        annot=True,
+        fmt="d",
+        ax=ax,
+        cmap="Blues",
+        xticklabels=labels,
+        yticklabels=labels,
+        linewidths=0.5,
+    )
+    ax.set_xlabel("Predicted", fontsize=12)
+    ax.set_ylabel("Actual", fontsize=12)
+    ax.set_title(f"Confusion Matrix — {name}", fontsize=14)
+    plt.xticks(rotation=45, ha="right", fontsize=7)
+    plt.yticks(rotation=0, fontsize=7)
+    plt.tight_layout()
     fig.savefig(png_path, bbox_inches="tight", dpi=150)
     plt.close(fig)
     print(f"Confusion matrix PNG saved: {png_path}")
