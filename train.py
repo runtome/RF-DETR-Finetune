@@ -120,10 +120,11 @@ def train_main(args=None):
 
         # GPU info
         if torch.cuda.is_available():
-            n_gpu = torch.cuda.device_count()
-            gpu_names = [torch.cuda.get_device_name(i) for i in range(n_gpu)]
-            print(f"GPU: {n_gpu}x {gpu_names}")
+            n_gpus = torch.cuda.device_count()
+            gpu_names = [torch.cuda.get_device_name(i) for i in range(n_gpus)]
+            print(f"GPU: {n_gpus}x {gpu_names}")
         else:
+            n_gpus = 0
             print("GPU: not available, using CPU")
 
         # Dataset preparation
@@ -139,9 +140,13 @@ def train_main(args=None):
         # Training
         rfdetr_out = os.path.join(trial_dir, "rfdetr_raw")
         resolution = get_resolution(args.model)
-        print(f"\nStarting training  (resolution={resolution}x{resolution}) ...")
 
-        model.train(
+        if n_gpus > 1:
+            print(f"\nStarting training with {n_gpus} GPUs  (resolution={resolution}x{resolution}) ...")
+        else:
+            print(f"\nStarting training  (resolution={resolution}x{resolution}) ...")
+
+        train_kwargs = dict(
             dataset_dir=dataset_dir,
             epochs=args.epochs,
             batch_size=args.batch_size,
@@ -151,42 +156,48 @@ def train_main(args=None):
             lr=args.lr,
             output_dir=rfdetr_out,
         )
+        if n_gpus > 0:
+            train_kwargs["devices"] = n_gpus
+
+        model.train(**train_kwargs)
 
         print("\nTraining complete.")
 
-        # Copy checkpoints
-        for ckpt_name in [
-            "checkpoint_best_total.pth",
-            "checkpoint_best_regular.pth",
-            "checkpoint_best_ema.pth",
-        ]:
-            src = os.path.join(rfdetr_out, ckpt_name)
-            if os.path.exists(src):
-                shutil.copy2(src, os.path.join(save_model_dir, ckpt_name))
-                print(f"Checkpoint saved: {os.path.join(save_model_dir, ckpt_name)}")
+        # DDP spawns one process per GPU; only rank 0 should write output files
+        is_main = os.environ.get("LOCAL_RANK", "0") == "0"
 
-        # Copy TensorBoard events
-        for evt in glob.glob(os.path.join(rfdetr_out, "events.out.tfevents.*")):
-            shutil.copy2(evt, tensorboard_dir)
-            print(f"TensorBoard event copied: {os.path.basename(evt)}")
-        # Also check subdirectories PTL might create
-        for evt in glob.glob(os.path.join(rfdetr_out, "**", "events.out.tfevents.*"), recursive=True):
-            shutil.copy2(evt, tensorboard_dir)
+        if is_main:
+            # Copy checkpoints
+            for ckpt_name in [
+                "checkpoint_best_total.pth",
+                "checkpoint_best_regular.pth",
+                "checkpoint_best_ema.pth",
+            ]:
+                src = os.path.join(rfdetr_out, ckpt_name)
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(save_model_dir, ckpt_name))
+                    print(f"Checkpoint saved: {os.path.join(save_model_dir, ckpt_name)}")
 
-        # Plot loss / mAP curves from CSV
-        metrics_csv = os.path.join(rfdetr_out, "metrics.csv")
-        from utils.metrics import plot_metrics_from_csv
-        plot_metrics_from_csv(metrics_csv, trial_dir, trial)
+            # Copy TensorBoard events
+            for evt in glob.glob(os.path.join(rfdetr_out, "events.out.tfevents.*")):
+                shutil.copy2(evt, tensorboard_dir)
+                print(f"TensorBoard event copied: {os.path.basename(evt)}")
+            # Also check subdirectories PTL might create
+            for evt in glob.glob(os.path.join(rfdetr_out, "**", "events.out.tfevents.*"), recursive=True):
+                shutil.copy2(evt, tensorboard_dir)
 
-        # Post-training evaluation: confusion matrix on valid split
-        best_path = os.path.join(save_model_dir, "checkpoint_best_total.pth")
-        if os.path.exists(best_path):
-            print("\nRunning confusion matrix on validation set ...")
-            eval_model = load_model_for_eval(trial_dir, args.model, best_path)
-            if eval_model is not None:
-                from utils.metrics import compute_confusion_matrix, save_confusion_matrix
-                guard = os.environ.get("LOCAL_RANK", "0")
-                if guard == "0":
+            # Plot loss / mAP curves from CSV
+            metrics_csv = os.path.join(rfdetr_out, "metrics.csv")
+            from utils.metrics import plot_metrics_from_csv
+            plot_metrics_from_csv(metrics_csv, trial_dir, trial)
+
+            # Post-training evaluation: confusion matrix on valid split
+            best_path = os.path.join(save_model_dir, "checkpoint_best_total.pth")
+            if os.path.exists(best_path):
+                print("\nRunning confusion matrix on validation set ...")
+                eval_model = load_model_for_eval(trial_dir, args.model, best_path)
+                if eval_model is not None:
+                    from utils.metrics import compute_confusion_matrix, save_confusion_matrix
                     cm = compute_confusion_matrix(
                         eval_model,
                         image_dir=os.path.join(dataset_dir, "valid", "images"),
@@ -194,15 +205,15 @@ def train_main(args=None):
                         class_names=class_names,
                     )
                     save_confusion_matrix(cm, trial_dir, trial)
-        else:
-            print(f"[WARN] Best checkpoint not found at {best_path}; skipping confusion matrix.")
+            else:
+                print(f"[WARN] Best checkpoint not found at {best_path}; skipping confusion matrix.")
 
-        print("\n" + "=" * 60)
-        print(f"All outputs saved to: {trial_dir}")
-        print(f"  Weights    : {save_model_dir}")
-        print(f"  TensorBoard: {tensorboard_dir}  →  tensorboard --logdir {tensorboard_dir}")
-        print(f"  Log        : {log_path}")
-        print("=" * 60)
+            print("\n" + "=" * 60)
+            print(f"All outputs saved to: {trial_dir}")
+            print(f"  Weights    : {save_model_dir}")
+            print(f"  TensorBoard: {tensorboard_dir}  →  tensorboard --logdir {tensorboard_dir}")
+            print(f"  Log        : {log_path}")
+            print("=" * 60)
 
     finally:
         sys.stdout = orig_stdout
