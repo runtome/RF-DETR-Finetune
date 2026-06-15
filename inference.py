@@ -87,7 +87,32 @@ def load_model(ckpt_path: str, model_name: str | None = None):
     )
 
 
-def annotate_image(img_bgr, detections: sv.Detections, class_names):
+def _draw_count_overlay(img, counts: dict, corner: str, text_color, bg_alpha: float = 0.55):
+    """Draw a class-count box at 'top-left' or 'top-right'."""
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.55
+    thickness  = 1
+    pad        = 6
+    line_h     = 20
+    lines      = [f"{cls}: {n}" for cls, n in sorted(counts.items())]
+    if not lines:
+        return
+    box_w = max(cv2.getTextSize(l, font, font_scale, thickness)[0][0] for l in lines) + pad * 2
+    box_h = line_h * len(lines) + pad * 2
+    h, w  = img.shape[:2]
+    x0    = w - box_w if corner == "top-right" else 0
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x0, 0), (x0 + box_w, box_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, bg_alpha, img, 1 - bg_alpha, 0, img)
+    for i, line in enumerate(lines):
+        y = pad + line_h * i + line_h - 4
+        cv2.putText(img, line, (x0 + pad, y), font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+
+def annotate_image(img_bgr, detections: sv.Detections, class_names,
+                   gt_detections: sv.Detections | None = None):
+    from collections import Counter
+
     box_ann   = sv.BoxAnnotator()
     label_ann = sv.LabelAnnotator()
     labels = []
@@ -97,7 +122,38 @@ def annotate_image(img_bgr, detections: sv.Detections, class_names):
             labels.append(f"{name} {conf:.2f}")
     annotated = box_ann.annotate(scene=img_bgr.copy(), detections=detections)
     annotated = label_ann.annotate(scene=annotated, detections=detections, labels=labels)
+
+    # Prediction count overlay — top-left, white text
+    if detections.class_id is not None and len(detections.class_id) > 0:
+        pred_counts = Counter(
+            class_names[cid] if cid < len(class_names) else str(cid)
+            for cid in detections.class_id
+        )
+        _draw_count_overlay(annotated, pred_counts, "top-left", (255, 255, 255))
+
+    # GT overlay — EDA mode only
+    if gt_detections is not None and gt_detections.class_id is not None and len(gt_detections.class_id) > 0:
+        # Red bounding boxes for ground truth
+        for box in gt_detections.xyxy:
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+        # GT count overlay — top-right, red text
+        gt_counts = Counter(
+            class_names[cid] if cid < len(class_names) else str(cid)
+            for cid in gt_detections.class_id
+        )
+        _draw_count_overlay(annotated, gt_counts, "top-right", (0, 0, 255))
+
     return annotated
+
+
+def _infer_label_dir(img_path: Path) -> Path | None:
+    """Guess the labels directory from an image path (.../split/images/ → .../split/labels/)."""
+    sibling = img_path.parent.parent / "labels"
+    if sibling.is_dir():
+        return sibling
+    return img_path.parent  # fallback: same dir
 
 
 def collect_images(file_arg: str | None, validate_split: str | None, source: str):
@@ -146,6 +202,8 @@ def run_inference(args=None):
     parser.add_argument("--threshold",     type=float, default=DEFAULT_CONF_THRESHOLD)
     parser.add_argument("--iou-threshold", type=float, default=DEFAULT_IOU_THRESHOLD)
     parser.add_argument("--source", default=SOURCE_DATASET, help="Source dataset directory")
+    parser.add_argument("--EDA", action="store_true", default=False,
+                        help="EDA mode: overlay GT boxes in red (top-right) alongside predictions")
 
     if args is None:
         args = parser.parse_args()
@@ -207,14 +265,20 @@ def run_inference(args=None):
         image_files, label_dir = collect_images(args.file, args.validate, args.source)
         print(f"Images to process: {len(image_files)}")
 
-        # Import label parser for --validate mode
+        # Import label parser for --validate and --EDA modes
         do_metrics = args.validate is not None and label_dir is not None
-        if do_metrics:
+        do_eda     = args.EDA
+        need_labels = do_metrics or do_eda
+        if need_labels:
             from utils.metrics import yolo_label_to_detections, _det_to_tm_pred, _det_to_tm_target
+        if do_metrics:
             preds_sv:   list = []
             targets_sv: list = []
             preds_tm:   list = []
             targets_tm: list = []
+
+        if do_eda:
+            print("EDA mode ON — GT labels drawn in red (top-right); predictions in colour (top-left)")
 
         time_records: list = []
 
@@ -231,15 +295,19 @@ def run_inference(args=None):
             detections = model.predict(img_rgb, threshold=args.threshold)
             elapsed_ms = (time.perf_counter() - t0) * 1000
 
-            annotated = annotate_image(img_bgr, detections, class_names)
+            # Load GT for --validate and/or --EDA
+            gt = None
+            if need_labels:
+                lbl_dir = label_dir or _infer_label_dir(img_path)
+                gt = yolo_label_to_detections(str(lbl_dir / (img_path.stem + ".txt")), w, h)
+
+            annotated = annotate_image(img_bgr, detections, class_names,
+                                       gt_detections=gt if do_eda else None)
             cv2.imwrite(os.path.join(img_out_dir, img_path.name), annotated)
             time_records.append({"filename": img_path.name, "inference_time_ms": f"{elapsed_ms:.2f}"})
 
             # Collect for metrics (--validate only)
-            if do_metrics:
-                gt = yolo_label_to_detections(
-                    str(label_dir / (img_path.stem + ".txt")), w, h
-                )
+            if do_metrics and gt is not None:
                 preds_sv.append(detections)
                 targets_sv.append(gt)
                 preds_tm.append(_det_to_tm_pred(detections))
